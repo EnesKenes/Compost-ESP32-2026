@@ -1,0 +1,483 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include "mbedtls/md.h"
+#include <esp_sntp.h>   // NTP / SNTP for ESP32
+
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME680.h>
+#include "DHT.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// All system configurations exist in the files below
+#include "secrets.h"
+#include "config.h"
+#include "nvs_manager.h"
+#include "captive_portal.h"
+
+#define DEBUG true
+#define LOG(msg) if(DEBUG) Serial.println(msg)
+
+// ============================================================
+//  SENSOR PIN DEFINITIONS
+// ============================================================
+#define BME_SDA      22
+#define BME_SCL      23
+#define DHTPIN        4
+#define DHTTYPE   DHT22
+#define ONE_WIRE_BUS 15
+#define BATTERY_PIN  34
+
+// ============================================================
+//  OBJECTS
+// ============================================================
+WebServer server(80);
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
+
+Adafruit_BME680 bme;
+DHT dht(DHTPIN, DHTTYPE);
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+
+// ============================================================
+//  SENSOR VARIABLES
+// ============================================================
+float bmeTemp, bmeHum, bmePressure, bmeGas;
+float dhtTemp, dhtHum;
+float ds18b20Temp;
+float batteryVoltage = 0.0;
+int   batteryPercent = 0;
+
+bool bmeStatus = false;
+bool bmeError  = false;
+bool dhtError  = false;
+bool dsError   = false;
+
+unsigned long lastUpdate  = 0;
+unsigned long lastPublish = 0;
+
+unsigned long lastNtpSync = 0;   // millis() value of the last successful NTP sync
+bool          ntpSynced   = false; // true once we have at least one valid sync
+
+// ============================================================
+//  NTP HELPERS
+// ============================================================
+
+// Returns true only after at least one successful NTP sync AND
+// the resulting time looks plausible (year >= 2024).
+bool timeIsSynced() {
+  if (!ntpSynced) return false;
+  struct tm ti;
+  if (!getLocalTime(&ti, 0)) return false;   // 0 ms timeout — non-blocking
+  return (ti.tm_year + 1900 >= 2024);
+}
+
+// Kick off an NTP sync.  configTime() is non-blocking; the ESP32 SNTP
+// stack updates the system clock in the background via a callback.
+void syncNTP() {
+  LOG("[NTP] Requesting time sync...");
+  configTime(NTP_GMT_OFFSET_SEC, NTP_DAYLIGHT_OFFSET_SEC,
+             NTP_SERVER1, NTP_SERVER2);
+
+  // Block for up to 10 s waiting for the first sync.
+  // getLocalTime() returns false if the clock is not yet set.
+  struct tm ti;
+  if (getLocalTime(&ti, 10000) && (ti.tm_year + 1900 >= 2024)) {
+    ntpSynced   = true;
+    lastNtpSync = millis();
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
+    LOG("[NTP] Time synced: " + String(buf));
+  } else {
+    LOG("[NTP] Sync failed — will retry next cycle");
+  }
+}
+
+// Returns the current UNIX timestamp (seconds since epoch).
+// Safe to call at any time; returns 0 when the clock is not yet set.
+time_t getUnixTime() {
+  if (!timeIsSynced()) return 0;
+  return time(nullptr);  // time() calls are safe once SNTP has set the clock
+}
+
+// Fills buf with a human-readable local-time string, e.g.
+// "2026-04-13 15:42:07".  Returns false and leaves buf untouched
+// if the clock is not yet valid.
+bool getTimeString(char* buf, size_t len) {
+  if (!timeIsSynced()) return false;
+  struct tm ti;
+  if (!getLocalTime(&ti, 0)) return false;
+  strftime(buf, len, "%Y-%m-%d %H:%M:%S", &ti);
+  return true;
+}
+
+// ============================================================
+//  HMAC-SHA256
+// ============================================================
+void computeHMAC(const char* message, char* outHex) {
+  byte hmacResult[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_type_t mdType = MBEDTLS_MD_SHA256;
+
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(mdType), 1);
+  mbedtls_md_hmac_starts(&ctx, (const unsigned char*)HMAC_SECRET, strlen(HMAC_SECRET));
+  mbedtls_md_hmac_update(&ctx, (const unsigned char*)message, strlen(message));
+  mbedtls_md_hmac_finish(&ctx, hmacResult);
+  mbedtls_md_free(&ctx);
+
+  for (int i = 0; i < 32; i++) {
+    sprintf(outHex + (i * 2), "%02x", hmacResult[i]);
+  }
+  outHex[64] = '\0';
+}
+
+// ============================================================
+//  PUBLISH TELEMETRY
+// ============================================================
+void publishTelemetry() {
+  // dataDoc now holds sensor readings + errors object.
+  // Erring sensors emit null instead of a potentially garbage value.
+  StaticJsonDocument<384> dataDoc;
+
+  if (bmeError) {
+    dataDoc["bme_temp"]     = nullptr;
+    dataDoc["bme_hum"]      = nullptr;
+    dataDoc["bme_pressure"] = nullptr;
+    dataDoc["bme_gas"]      = nullptr;
+  } else {
+    dataDoc["bme_temp"]     = bmeTemp;
+    dataDoc["bme_hum"]      = bmeHum;
+    dataDoc["bme_pressure"] = bmePressure;
+    dataDoc["bme_gas"]      = bmeGas;
+  }
+
+  if (dhtError) {
+    dataDoc["dht_temp"] = nullptr;
+    dataDoc["dht_hum"]  = nullptr;
+  } else {
+    dataDoc["dht_temp"] = dhtTemp;
+    dataDoc["dht_hum"]  = dhtHum;
+  }
+
+  if (dsError) {
+    dataDoc["ds18b20_temp"] = nullptr;
+  } else {
+    dataDoc["ds18b20_temp"] = ds18b20Temp;
+  }
+
+  // dataDoc["bat_v"]   = batteryVoltage;
+  dataDoc["bat_pct"] = batteryPercent;
+
+  JsonObject errors  = dataDoc.createNestedObject("errors");
+  errors["bme"]      = bmeError;
+  errors["dht"]      = dhtError;
+  errors["ds18b20"]  = dsError;
+
+  char dataJson[384];
+  serializeJson(dataDoc, dataJson, sizeof(dataJson));
+
+  // Use UNIX epoch when the clock is synced; fall back to millis() and
+  // mark it clearly so subscribers know which scale they are getting.
+  time_t    unixNow  = getUnixTime();          // 0 if not yet synced
+  bool      hasEpoch = (unixNow > 0);
+  uint32_t  nonce    = esp_random();           // hardware RNG built into ESP32
+
+  // signable string uses the same ts value that goes in the envelope
+  char signable[512];
+  if (hasEpoch) {
+    snprintf(signable, sizeof(signable),
+             "%lu|%u|%s|%s", (unsigned long)unixNow, nonce, DEVICE_ID, dataJson);
+  } else {
+    snprintf(signable, sizeof(signable),
+             "%lu|%u|%s|%s", millis(), nonce, DEVICE_ID, dataJson);
+  }
+
+  char sig[65];
+  computeHMAC(signable, sig);
+
+  StaticJsonDocument<768> envelope;
+  if (hasEpoch) {
+    envelope["ts"]      = (unsigned long)unixNow;
+    envelope["ts_type"] = "unix";
+  } else {
+    envelope["ts"]      = millis();
+    envelope["ts_type"] = "millis";   // subscribers must not treat as epoch
+  }
+  envelope["nonce"] = nonce;
+  envelope["dev"]   = DEVICE_ID;
+  envelope["data"]  = dataDoc;
+  envelope["sig"]   = sig;
+
+  char payload[768];
+  serializeJson(envelope, payload, sizeof(payload));
+
+  if (mqtt.publish(TOPIC_TELEMETRY, payload, false)) {
+    LOG("[MQTT] Telemetry published:");
+    LOG(payload);
+  } else {
+    LOG("[MQTT] Publish FAILED");
+  }
+}
+
+// ============================================================
+//  MQTT RECONNECT WITH EXPONENTIAL BACKOFF
+// ============================================================
+void mqttReconnect() {
+  int retryDelay = 1000;
+  while (!mqtt.connected()) {
+    Serial.print("[MQTT] Connecting...");
+    String clientId = String("compost-") + String(DEVICE_ID) + "-" + String(random(0xffff), HEX);
+
+    if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
+      LOG(" connected!");
+    } else {
+      Serial.print(" failed, rc=");
+      Serial.print(mqtt.state());
+      Serial.print(". Retry in ");
+      Serial.print(retryDelay / 1000);
+      LOG("s");
+      delay(retryDelay);
+      retryDelay = min(retryDelay * 2, 60000);
+    }
+  }
+}
+
+// ============================================================
+//  BATTERY
+// ============================================================
+float readBatteryVoltage() {
+  long sum = 0;
+  for (int i = 0; i < 20; i++) {
+    sum += analogRead(BATTERY_PIN);
+    delay(5);
+  }
+  float raw        = sum / 20.0;
+  float adcVoltage = (raw / 4095.0) * 3.3;
+  float battV      = adcVoltage * 2.0;
+  battV *= 1.08;
+  return battV;
+}
+
+int batteryPercentage(float v) {
+  if (v >= 4.45) return 100;
+  if (v >= 4.30) return 95;
+  if (v >= 4.20) return 90;
+  if (v >= 4.10) return 80;
+  if (v >= 4.00) return 70;
+  if (v >= 3.90) return 60;
+  if (v >= 3.80) return 50;
+  if (v >= 3.70) return 40;
+  if (v >= 3.60) return 30;
+  if (v >= 3.45) return 20;
+  if (v >= 3.30) return 10;
+  return 5;
+}
+
+// ============================================================
+//  READ SENSORS
+// ============================================================
+void readSensors() {
+  batteryVoltage = readBatteryVoltage();
+  batteryPercent = batteryPercentage(batteryVoltage);
+
+  // BME680
+  Wire.beginTransmission(0x77);
+  if (Wire.endTransmission() != 0) {
+    LOG("BME680 not found!");
+    bmeStatus = false;
+    bmeError  = true;
+  } else {
+    if (!bmeStatus) {
+      LOG("BME680 reconnected, reinitializing...");
+      bme.begin();
+      bme.setTemperatureOversampling(BME680_OS_8X);
+      bme.setHumidityOversampling(BME680_OS_2X);
+      bme.setPressureOversampling(BME680_OS_4X);
+      bme.setGasHeater(320, 150);
+      bmeStatus = true;
+    }
+    if (!bme.performReading()) {
+      LOG("BME680 read failed!");
+      bmeError    = true;
+      bmeTemp     = NAN;
+      bmeHum      = NAN;
+      bmePressure = NAN;
+      bmeGas      = NAN;
+    } else {
+      bmeError    = false;
+      bmeTemp     = bme.temperature - 0.7;
+      bmeHum      = bme.humidity * 1.23 + 2.85;
+      bmePressure = bme.pressure / 100.0;
+      bmeGas      = bme.gas_resistance / 1000.0;
+    }
+  }
+
+  // DHT22
+  dhtTemp  = dht.readTemperature();
+  dhtHum   = dht.readHumidity();
+  dhtError = (isnan(dhtTemp) || isnan(dhtHum) ||
+              dhtTemp < -40  || dhtTemp > 80   ||
+              dhtHum  < 0    || dhtHum  > 100);
+
+  // DS18B20
+  ds18b20.requestTemperatures();
+  ds18b20Temp = ds18b20.getTempCByIndex(0);
+  dsError     = (ds18b20Temp < -55 || ds18b20Temp > 125);
+
+  lastUpdate = millis();
+}
+
+// ============================================================
+//  LOCAL WEB DASHBOARD
+// ============================================================
+void handleRoot() {
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<meta charset='UTF-8'>";
+  page += "<meta http-equiv='refresh' content='5'>";
+  page += "<title>Smart Compost Monitor</title>";
+  page += "<style>";
+  page += "body{font-family:Arial;text-align:center;background:#f4f4f4;}";
+  page += "h1{color:#2e7d32;}";
+  page += ".card{background:white;padding:20px;margin:20px;border-radius:10px;box-shadow:0 0 10px #ccc;}";
+  page += ".error{color:red;font-weight:bold;}";
+  page += ".mqtt_ok{color:green;font-weight:bold;}";
+  page += ".mqtt_err{color:orange;font-weight:bold;}";
+  page += ".ntp_ok{color:green;}";
+  page += ".ntp_err{color:orange;}";
+  page += "</style></head><body>";
+
+  page += "<h1>🌱 Smart Compost Monitor</h1>";
+
+  // ---- Current time / NTP status ----
+  char timeBuf[32];
+  if (getTimeString(timeBuf, sizeof(timeBuf))) {
+    page += "<p>🕐 <b>" + String(timeBuf) + "</b> (UTC+3)</p>";
+    unsigned long syncAge = (millis() - lastNtpSync) / 1000UL;
+    page += "<p class='ntp_ok'>● NTP synced &mdash; last sync ";
+    page += String(syncAge);
+    page += " s ago</p>";
+  } else {
+    page += "<p class='ntp_err'>● NTP not yet synced — uptime: ";
+    page += String(millis() / 1000);
+    page += " s</p>";
+  }
+
+  // ---- Last sensor update ----
+  page += "<p>Last sensor update: " + String(lastUpdate / 1000) + " s since start</p>";
+
+  // ---- MQTT status ----
+  if (mqtt.connected()) {
+    page += "<p class='mqtt_ok'>● MQTT connected</p>";
+  } else {
+    page += "<p class='mqtt_err'>● MQTT disconnected</p>";
+  }
+
+  if (bmeError || dhtError || dsError) {
+    page += "<h2 class='error'>⚠ Sensor error detected!</h2>";
+    if (bmeError) page += "<p class='error'>BME680 reading abnormal!</p>";
+    if (dhtError) page += "<p class='error'>DHT22 reading abnormal!</p>";
+    if (dsError)  page += "<p class='error'>DS18B20 reading abnormal!</p>";
+  }
+
+  page += "<div class='card'><h2>Battery</h2>";
+  page += "Loaded Voltage: " + String(batteryVoltage, 2) + " V<br>";
+  page += "Estimated Charge: " + String(batteryPercent) + " %</div>";
+
+  page += "<div class='card'><h2>DS18B20</h2>";
+  page += "Temperature: " + String(ds18b20Temp) + " °C</div>";
+
+  page += "<div class='card'><h2>BME680</h2>";
+  page += "Temp: "           + String(bmeTemp)     + " °C<br>";
+  page += "Humidity: "       + String(bmeHum)      + " %<br>";
+  page += "Gas Resistance: " + String(bmeGas)      + " kΩ<br>";
+  page += "Pressure: "       + String(bmePressure) + " hPa</div>";
+
+  page += "<div class='card'><h2>DHT22</h2>";
+  page += "Temp: "     + String(dhtTemp) + " °C<br>";
+  page += "Humidity: " + String(dhtHum)  + " %</div>";
+
+  page += "</body></html>";
+  server.send(200, "text/html", page);
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  LOG("Starting Smart Compost Monitor");
+
+  if (!credentialsExist()) {
+    startCaptivePortal();
+  }
+  
+  loadCredentials();
+
+  dht.begin();
+  ds18b20.begin();
+  analogReadResolution(12);
+
+  Wire.begin(BME_SDA, BME_SCL);
+  if (!bme.begin()) {
+    LOG("BME680 not found!");
+    while (1);
+  }
+  bme.setTemperatureOversampling(BME680_OS_8X);
+  bme.setHumidityOversampling(BME680_OS_2X);
+  bme.setPressureOversampling(BME680_OS_4X);
+  bme.setGasHeater(320, 150);
+  bmeStatus = true;
+
+  WiFi.begin(nvs_wifi_ssid, nvs_wifi_pass);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  LOG("\nWiFi connected!");
+  LOG("Dashboard IP: " + WiFi.localIP().toString());
+
+  // First NTP sync — runs once at boot after WiFi is ready
+  syncNTP();
+
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setBufferSize(768);
+  mqttReconnect();
+
+  server.on("/", handleRoot);
+  server.begin();
+}
+
+// ============================================================
+//  LOOP
+// ============================================================
+void loop() {
+  // Periodic NTP resync every 24 hours.
+  // Also handles the initial retry if the boot-time sync failed.
+  if (!ntpSynced ||
+      (millis() - lastNtpSync >= NTP_RESYNC_MS)) {
+    if (WiFi.status() == WL_CONNECTED) {
+      syncNTP();
+    }
+  }
+
+  if (!mqtt.connected()) {
+    mqttReconnect();
+  }
+  mqtt.loop();
+
+  readSensors();
+
+  if (millis() - lastPublish >= PUBLISH_INTERVAL_MS) {
+    publishTelemetry();
+    lastPublish = millis();
+  }
+
+  server.handleClient();
+}
