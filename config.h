@@ -8,7 +8,7 @@
 // Timing config
 #define PUBLISH_INTERVAL_MS  10UL * 1000UL                    // 10 seconds for testing
 #define NTP_RESYNC_MS    24UL * 60UL * 60UL * 1000UL          // 24 hours in ms
-#define SLEEP_DURATION_US    1ULL * 60ULL * 1000000ULL       // 20 minutes in microseconds
+#define SLEEP_DURATION_US    1ULL * 60ULL * 1000000ULL        // 20 minutes in microseconds
 
 // NTP config
 #define NTP_SERVER1              "pool.ntp.org"

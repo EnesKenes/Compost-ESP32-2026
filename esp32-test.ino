@@ -20,7 +20,7 @@
 #include "rgb_led.h"
 
 #define DEBUG false
-#define LOGGING
+#define LOGGING true
 #define LOG(msg) \
   if (LOGGING) Serial.println(msg)
 
