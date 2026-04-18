@@ -9,7 +9,7 @@
 
 // AP name the user will see on their phone
 #define AP_SSID "CompostMonitor-Setup"
-#define AP_PASS ""  // no password, open network for easy setup
+#define AP_PASS "compost123"  // default password for esp32 AP, provides WAP2 encryption on air
 
 DNSServer    dnsServer;
 WebServer    portalServer(80);
