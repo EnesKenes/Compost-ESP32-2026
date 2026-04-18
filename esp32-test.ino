@@ -1,7 +1,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <PubSubClient.h>
+#include <AsyncMqttClient.h>
 #include <ArduinoJson.h>
 #include "mbedtls/md.h"
 #include <esp_sntp.h>  // NTP / SNTP for ESP32
@@ -20,7 +20,9 @@
 #include "rgb_led.h"
 
 #define DEBUG false
-#define LOG(msg) Serial.println(msg)
+#define LOGGING
+#define LOG(msg) \
+  if (LOGGING) Serial.println(msg)
 
 // ============================================================
 //  SENSOR PIN DEFINITIONS
@@ -35,8 +37,12 @@
 // ============================================================
 //  OBJECTS
 // ============================================================
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
+AsyncMqttClient mqtt;
+
+// RTC memory that survives deep sleep
+// pubackReceived: set to true in the PUBACK callback before sleeping,
+// so we know QoS 1 delivery was confirmed by the broker.
+RTC_DATA_ATTR bool pubackReceived = false;
 
 #if DEBUG
 WebServer server(80);
@@ -64,7 +70,7 @@ bool dsError = false;
 unsigned long lastUpdate = 0;
 unsigned long lastPublish = 0;
 
-// RTC memory survives deep sleep — used to track NTP sync across wake cycles
+// RTC memory survives deep sleep - used to track NTP sync across wake cycles
 RTC_DATA_ATTR time_t lastNtpSyncUnix = 0;  // unix timestamp of last successful sync
 RTC_DATA_ATTR bool ntpSynced = false;       // true once we have at least one valid sync
 
@@ -80,7 +86,7 @@ unsigned long lastNtpSync = 0;
 bool timeIsSynced() {
   if (!ntpSynced) return false;
   struct tm ti;
-  if (!getLocalTime(&ti, 0)) return false;  // 0 ms timeout — non-blocking
+  if (!getLocalTime(&ti, 0)) return false;  // 0 ms timeout - non-blocking
   return (ti.tm_year + 1900 >= 2024);
 }
 
@@ -94,13 +100,13 @@ void syncNTP() {
   struct tm ti;
   if (getLocalTime(&ti, 10000) && (ti.tm_year + 1900 >= 2024)) {
     ntpSynced = true;
-    lastNtpSyncUnix = time(nullptr);  // store in RTC memory — survives deep sleep
+    lastNtpSyncUnix = time(nullptr);  // store in RTC memory - survives deep sleep
     lastNtpSync = millis();           // for dashboard display only
     char buf[32];
     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
     LOG("[NTP] Time synced: " + String(buf));
   } else {
-    LOG("[NTP] Sync failed — will retry next cycle");
+    LOG("[NTP] Sync failed - will retry next cycle");
   }
 }
 
@@ -111,6 +117,7 @@ time_t getUnixTime() {
   return time(nullptr);  // time() calls are safe once SNTP has set the clock
 }
 
+#if DEBUG
 // Fills buf with a human-readable local-time string, e.g.
 // "2026-04-13 15:42:07".  Returns false and leaves buf untouched
 // if the clock is not yet valid.
@@ -121,6 +128,7 @@ bool getTimeString(char* buf, size_t len) {
   strftime(buf, len, "%Y-%m-%d %H:%M:%S", &ti);
   return true;
 }
+#endif
 
 // ============================================================
 //  HMAC-SHA256
@@ -144,11 +152,9 @@ void computeHMAC(const char* message, char* outHex) {
 }
 
 // ============================================================
-//  PUBLISH TELEMETRY
+//  PUBLISH TELEMETRY  (QoS 1 - broker must acknowledge)
 // ============================================================
 void publishTelemetry() {
-  // dataDoc now holds sensor readings + errors object.
-  // Erring sensors emit null instead of a potentially garbage value.
   StaticJsonDocument<384> dataDoc;
 
   if (bmeError) {
@@ -188,13 +194,10 @@ void publishTelemetry() {
   char dataJson[384];
   serializeJson(dataDoc, dataJson, sizeof(dataJson));
 
-  // Use UNIX epoch when the clock is synced; fall back to millis() and
-  // mark it clearly so subscribers know which scale they are getting.
-  time_t unixNow = getUnixTime();  // 0 if not yet synced
+  time_t unixNow = getUnixTime();
   bool hasEpoch = (unixNow > 0);
-  uint32_t nonce = esp_random();  // hardware RNG built into ESP32
+  uint32_t nonce = esp_random();
 
-  // signable string uses the same ts value that goes in the envelope
   char signable[512];
   if (hasEpoch) {
     snprintf(signable, sizeof(signable),
@@ -213,7 +216,7 @@ void publishTelemetry() {
     envelope["ts_type"] = "unix";
   } else {
     envelope["ts"] = millis();
-    envelope["ts_type"] = "millis";  // subscribers must not treat as epoch
+    envelope["ts_type"] = "millis";
   }
   envelope["nonce"] = nonce;
   envelope["dev"] = DEVICE_ID;
@@ -223,52 +226,70 @@ void publishTelemetry() {
   char payload[768];
   serializeJson(envelope, payload, sizeof(payload));
 
-  if (mqtt.publish(TOPIC_TELEMETRY, payload, false)) {
-    LOG("[MQTT] Telemetry published:");
-    LOG(payload);
+  // Publish at QoS 1 - broker will send a PUBACK when it has received the message.
+  // The onPublish callback sets pubackReceived = true when the ack arrives.
+  pubackReceived = false;
+  uint16_t packetId = mqtt.publish(TOPIC_TELEMETRY, 1, false, payload);
+
+  if (packetId == 0) {
+    LOG("[MQTT] Publish failed (queue full or not connected)");
   } else {
-    LOG("[MQTT] Publish FAILED, retrying...");
-    delay(500);
-    mqtt.loop();
-    if (mqtt.publish(TOPIC_TELEMETRY, payload, false)) {
-      LOG("[MQTT] Retry successful");
+    LOG("[MQTT] Publish queued, packetId=" + String(packetId) + ", waiting for PUBACK...");
+    // Wait up to 5 s for the broker to acknowledge
+    unsigned long ackDeadline = millis() + 5000;
+    while (!pubackReceived && millis() < ackDeadline) {
+      delay(10);
+    }
+    if (pubackReceived) {
+      LOG("[MQTT] PUBACK received - delivery confirmed");
+      LOG(payload);
     } else {
-      LOG("[MQTT] Retry also failed");
+      LOG("[MQTT] PUBACK timeout - packet may be lost");
     }
   }
 
-  // Flash blue to signal transmission, then settle into steady state
+  // Flash blue to signal transmission attempt, then restore steady state
   ledFlashPublish(3);
   bool anySensorError = (bmeError || dhtError || dsError);
   if (anySensorError) {
-    ledSensorError();  // RED — steady, sensor fault
+    ledSensorError();
   } else {
-    ledOK();           // GREEN — steady, all good
+    ledOK();
   }
 }
 
 // ============================================================
-//  MQTT RECONNECT WITH EXPONENTIAL BACKOFF
+//  ASYNC MQTT CALLBACKS
+// ============================================================
+void onMqttConnect(bool sessionPresent) {
+  LOG("[MQTT] Connected (sessionPresent=" + String(sessionPresent) + ")");
+  ledOK();
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  LOG("[MQTT] Disconnected, reason=" + String((int)reason));
+}
+
+void onMqttPublish(uint16_t packetId) {
+  // Called when the broker sends PUBACK for a QoS 1 message
+  LOG("[MQTT] PUBACK for packetId=" + String(packetId));
+  pubackReceived = true;
+}
+
+// ============================================================
+//  MQTT CONNECT - blocks until connected (with timeout reboot)
 // ============================================================
 void mqttReconnect() {
-  int retryDelay = 1000;
+  ledWifiSetup();  // YELLOW - connecting
+  LOG("[MQTT] Connecting...");
+  mqtt.connect();
+  unsigned long start = millis();
   while (!mqtt.connected()) {
-    ledWifiSetup();  // YELLOW — reconnecting
-    Serial.print("[MQTT] Connecting...");
-    String clientId = String("compost-") + String(DEVICE_ID) + "-" + String(random(0xffff), HEX);
-
-    if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS)) {
-      LOG(" connected!");
-      ledOK();
-    } else {
-      Serial.print(" failed, rc=");
-      Serial.print(mqtt.state());
-      Serial.print(". Retry in ");
-      Serial.print(retryDelay / 1000);
-      LOG("s");
-      delay(retryDelay);
-      retryDelay = min(retryDelay * 2, 60000);
+    if (millis() - start > 10000) {
+      LOG("[MQTT] Connect timeout - rebooting...");
+      ESP.restart();
     }
+    delay(100);
   }
 }
 
@@ -307,7 +328,7 @@ int batteryPercentage(float v) {
 //  READ SENSORS
 // ============================================================
 void readSensors() {
-  ledCapturing();  // GREEN — actively reading sensors
+  ledCapturing();  // GREEN - actively reading sensors
 
   batteryVoltage = readBatteryVoltage();
   batteryPercent = batteryPercentage(batteryVoltage);
@@ -359,14 +380,14 @@ void readSensors() {
   // RED steady if any sensor failed, GREEN steady otherwise
   bool anySensorError = (bmeError || dhtError || dsError);
   if (anySensorError) {
-    ledSensorError();  // RED — sensor fault
+    ledSensorError();  // RED - sensor fault
   } else {
-    ledOK();           // GREEN — all sensors healthy
+    ledOK();           // GREEN - all sensors healthy
   }
 }
 
 // ============================================================
-//  LOCAL WEB DASHBOARD — debug mode only
+//  LOCAL WEB DASHBOARD - debug mode only
 // ============================================================
 #if DEBUG
 void handleRoot() {
@@ -396,7 +417,7 @@ void handleRoot() {
     page += String(syncAge);
     page += " s ago</p>";
   } else {
-    page += "<p class='ntp_err'>● NTP not yet synced — uptime: ";
+    page += "<p class='ntp_err'>● NTP not yet synced - uptime: ";
     page += String(millis() / 1000);
     page += " s</p>";
   }
@@ -449,7 +470,7 @@ void setup() {
   LOG("Starting Smart Compost Monitor");
 
   ledInit();       // configure GPIO pins
-  ledWifiSetup();  // YELLOW — provisioning / WiFi not yet connected
+  ledWifiSetup();  // YELLOW - provisioning / WiFi not yet connected
 
   // Upload and recomment to clear nvs
   // factoryReset();
@@ -479,7 +500,7 @@ void setup() {
   WiFi.persistent(false);  // don't write WiFi credentials to flash every boot
   WiFi.mode(WIFI_STA);     // ensure clean STA mode after deep sleep
 
-  // Static IP — skips DHCP negotiation which is a common source of
+  // Static IP - skips DHCP negotiation which is a common source of
   // delay and failure after deep sleep. Change these to match your network.
   IPAddress staticIP(192, 168, 1, 184);
   IPAddress gateway(192, 168, 1, 1);
@@ -492,7 +513,7 @@ void setup() {
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - wifiStart > 20000) {
-      LOG("\n[WiFi] Timeout — rebooting to retry...");
+      LOG("\n[WiFi] Timeout - rebooting to retry...");
       ESP.restart();
     }
     delay(500);
@@ -506,13 +527,18 @@ void setup() {
   if (!ntpSynced || (time(nullptr) - lastNtpSyncUnix >= NTP_RESYNC_MS / 1000UL)) {
     syncNTP();
   } else {
-    // Clock is already valid from RTC — restore it so getLocalTime() works
+    // Clock is already valid from RTC - restore it so getLocalTime() works
     configTime(NTP_GMT_OFFSET_SEC, NTP_DAYLIGHT_OFFSET_SEC, NTP_SERVER1, NTP_SERVER2);
     LOG("[NTP] Skipping sync - last sync was " + String(time(nullptr) - lastNtpSyncUnix) + "s ago");
   }
 
+  mqtt.onConnect(onMqttConnect);
+  mqtt.onDisconnect(onMqttDisconnect);
+  mqtt.onPublish(onMqttPublish);
   mqtt.setServer(MQTT_SERVER, MQTT_PORT);
-  mqtt.setBufferSize(768);
+  mqtt.setCredentials(MQTT_USER, MQTT_PASS);
+  String clientId = String("compost-") + String(DEVICE_ID) + "-" + String(random(0xffff), HEX);
+  mqtt.setClientId(clientId.c_str());
   mqttReconnect();
 
 #if DEBUG
@@ -531,7 +557,6 @@ void loop() {
 #if DEBUG
   // ── TEST MODE ───────────────────────────────────────────────
   if (!mqtt.connected()) mqttReconnect();
-  mqtt.loop();
 
   // Read sensors on the same interval as publish so the LED
   // state is visible between cycles instead of flickering
@@ -546,7 +571,6 @@ void loop() {
 #else
   // ── PRODUCTION MODE ─────────────────────────────────────────
   if (!mqtt.connected()) mqttReconnect();
-  mqtt.loop();
 
   readSensors();
   publishTelemetry();
@@ -558,7 +582,11 @@ void loop() {
     delay(2000);
   }
 
-  LOG("[Sleep] Entering deep sleep for 20 minutes...");
+  LOG("[Sleep] Entering deep sleep...");
+  mqtt.disconnect();
+  delay(200);  // let the DISCONNECT packet send before cutting power
+  WiFi.disconnect(true);
+  delay(100);
   ledOff();
   esp_deep_sleep(SLEEP_DURATION_US);
 #endif
