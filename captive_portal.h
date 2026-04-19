@@ -82,12 +82,11 @@ void handlePortalSave() {
   ESP.restart();
 }
 
-// Redirect all unknown URLs to the portal page — this is what
-// makes phones automatically open the page when they connect
+// Serves the setup page directly for any unknown URL.
+// This is what hotel captive portals do — no redirect, just show the page
+// regardless of what domain or path the browser requested.
 void handlePortalRedirect() {
-  portalServer.sendHeader("Location", "http://192.168.4.1/");
-  portalServer.sendHeader("Cache-Control", "no-cache");
-  portalServer.send(302, "text/plain", "");
+  handlePortalRoot();
 }
 
 // ============================================================
@@ -97,21 +96,28 @@ void startCaptivePortal() {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
 
+  // DNS wildcard — resolves every domain to the ESP32's AP IP
   dnsServer.start(53, "*", WiFi.softAPIP());
 
   portalServer.on("/", HTTP_GET, handlePortalRoot);
   portalServer.on("/save", HTTP_POST, handlePortalSave);
 
   // Android captive portal detection
-  portalServer.on("/generate_204",         handlePortalRedirect);
-  portalServer.on("/gen_204",              handlePortalRedirect);
-  // iOS / macOS captive portal detection  
-  portalServer.on("/hotspot-detect.html",  handlePortalRedirect);
+  portalServer.on("/generate_204",              handlePortalRedirect);
+  portalServer.on("/gen_204",                   handlePortalRedirect);
+  // iOS / macOS captive portal detection
+  portalServer.on("/hotspot-detect.html",       handlePortalRedirect);
   portalServer.on("/library/test/success.html", handlePortalRedirect);
+  portalServer.on("/success.html",              handlePortalRedirect);
   // Windows captive portal detection
-  portalServer.on("/ncsi.txt",             handlePortalRedirect);
-  portalServer.on("/connecttest.txt",      handlePortalRedirect);
-  // Fallback for everything else
+  portalServer.on("/ncsi.txt",                  handlePortalRedirect);
+  portalServer.on("/connecttest.txt",           handlePortalRedirect);
+  portalServer.on("/redirect",                  handlePortalRedirect);
+  // Samsung / generic
+  portalServer.on("/mobile/status.php",         handlePortalRedirect);
+  portalServer.on("/generate204",               handlePortalRedirect);
+  
+  // Catch everything else — serves the setup page for any URL
   portalServer.onNotFound(handlePortalRedirect);
 
   portalServer.begin();
