@@ -39,7 +39,7 @@
 // ============================================================
 AsyncMqttClient mqtt;
 
-// RTC memory that survives deep sleep
+// RTC memory - survives deep sleep
 // pubackReceived: set to true in the PUBACK callback before sleeping,
 // so we know QoS 1 delivery was confirmed by the broker.
 RTC_DATA_ATTR bool pubackReceived = false;
@@ -499,14 +499,6 @@ void setup() {
 
   WiFi.persistent(false);  // don't write WiFi credentials to flash every boot
   WiFi.mode(WIFI_STA);     // ensure clean STA mode after deep sleep
-
-  // Static IP - skips DHCP negotiation which is a common source of
-  // delay and failure after deep sleep. Change these to match your network.
-  IPAddress staticIP(192, 168, 1, 184);
-  IPAddress gateway(192, 168, 1, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  IPAddress dns(8, 8, 8, 8);
-  WiFi.config(staticIP, gateway, subnet, dns);
 
   WiFi.begin(nvs_wifi_ssid, nvs_wifi_pass);
   Serial.print("Connecting to WiFi");
