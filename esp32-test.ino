@@ -32,7 +32,7 @@
 #define DHTPIN 4
 #define DHTTYPE DHT22
 #define ONE_WIRE_BUS 15
-#define BATTERY_PIN 34
+#define BATTERY_PIN 35
 #define RESET_BUTTON_PIN 32
 
 // ============================================================
