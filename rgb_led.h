@@ -12,6 +12,7 @@
 //    RED     → sensor error
 //    BLUE    → transmitting MQTT
 //    YELLOW  → WiFi connecting / captive-portal setup
+//    WHITE   → idle / standby
 // ============================================================
 
 #define LED_R 25
@@ -39,6 +40,17 @@ inline void ledSensorError()  { ledSetRaw(true,  false, false); }
 
 // Yellow — WiFi connecting or captive-portal AP mode (steady)
 inline void ledWifiSetup()    { ledSetRaw(true,  true,  false); }
+
+// Yellow flashing — bad credentials, re-provisioning required
+// Distinct from steady yellow so user knows action is needed
+inline void ledFlashBadCredentials(int times = 6) {
+  for (int i = 0; i < times; i++) {
+    ledSetRaw(true, true, false);  // yellow on
+    delay(200);
+    ledOff();
+    delay(200);
+  }
+}
 
 // Blue — flash N times to signal a publish, then caller restores steady state
 inline void ledFlashPublish(int times = 3) {

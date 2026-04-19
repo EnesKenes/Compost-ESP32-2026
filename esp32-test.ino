@@ -33,6 +33,7 @@
 #define DHTTYPE DHT22
 #define ONE_WIRE_BUS 15
 #define BATTERY_PIN 34
+#define RESET_BUTTON_PIN 32
 
 // ============================================================
 //  OBJECTS
@@ -469,11 +470,38 @@ void setup() {
   delay(1000);
   LOG("Starting Smart Compost Monitor");
 
-  ledInit();       // configure GPIO pins
+  ledInit();
   ledWifiSetup();  // YELLOW - provisioning / WiFi not yet connected
 
-  // Upload and recomment to clear nvs
-  // factoryReset();
+  // ── Factory reset via long press ─────────────────────────────
+  // Hold the button for 5 seconds on boot to wipe credentials
+  // and re-enter the captive portal (e.g. for network change).
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    LOG("[Reset] Button held — hold 5s to factory reset...");
+    unsigned long holdStart = millis();
+    while (digitalRead(RESET_BUTTON_PIN) == LOW) {
+      // Flash red while waiting to show progress
+      ledSensorError();
+      delay(200);
+      ledOff();
+      delay(200);
+      if (millis() - holdStart >= 5000) {
+        LOG("[Reset] 5s reached — wiping credentials...");
+        // Flash red rapidly to confirm reset before wiping
+        for (int i = 0; i < 10; i++) {
+          ledSensorError();
+          delay(100);
+          ledOff();
+          delay(100);
+        }
+        factoryReset();  // wipes NVS and reboots into captive portal
+      }
+    }
+    // Released before 5s — ignore and continue normal boot
+    LOG("[Reset] Released early — continuing normal boot");
+    ledWifiSetup();
+  }
 
   if (!credentialsExist()) {
     startCaptivePortal();
@@ -504,13 +532,23 @@ void setup() {
   Serial.print("Connecting to WiFi");
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED) {
+    wl_status_t status = WiFi.status();
+
+    // Wrong password or SSID not found — only triggered during initial setup
+    // For normal outages the device will just timeout and reboot to retry
+    if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL) {
+      LOG("\n[WiFi] Connection rejected (status=" + String(status) + ") — rebooting to retry...");
+      ESP.restart();
+    }
+
     if (millis() - wifiStart > 20000) {
-      LOG("\n[WiFi] Timeout - rebooting to retry...");
+      LOG("\n[WiFi] Timeout — rebooting to retry...");
       ESP.restart();
     }
     delay(500);
     Serial.print(".");
   }
+
   LOG("\nWiFi connected!");
   LOG("IP: " + WiFi.localIP().toString());
   ledOK();
