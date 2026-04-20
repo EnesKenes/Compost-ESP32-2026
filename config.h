@@ -3,7 +3,7 @@
 #define CONFIG_H
 
 // MQTT config
-#define TOPIC_TELEMETRY   "compost/compost01/telemetry"
+#define TOPIC_TELEMETRY   "group6/compost01/telemetry"
 
 // Timing config
 #define PUBLISH_INTERVAL_MS  10UL * 1000UL                    // 10 seconds for testing
