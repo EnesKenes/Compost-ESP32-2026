@@ -62,6 +62,16 @@ inline void ledFlashPublish(int times = 3) {
   }
 }
 
+// Red flashing - indicates brownout problem
+inline void ledFlashBrownout(int times = 6) {
+  for (int i = 0; i < times; i++) {
+    ledSetRaw(true, false, false);  // red on
+    delay(200);
+    ledOff();
+    delay(200);
+  }
+}
+
 // Kept for internal use during sensor read (brief green pulse is fine
 // since ledOK() is also green — user sees no change on success)
 inline void ledCapturing()    { ledSetRaw(false, true,  false); }

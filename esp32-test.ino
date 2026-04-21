@@ -62,6 +62,7 @@ float dhtTemp, dhtHum;
 float ds18b20Temp;
 float batteryVoltage = 0.0;
 int batteryPercent = 0;
+bool brownoutPending = false;  // set by handleBrownoutIfNeeded(), consumed by publishTelemetry()
 
 bool bmeStatus = false;
 bool bmeError = false;
@@ -187,6 +188,11 @@ void publishTelemetry() {
   dataDoc["bat_v"]   = batteryVoltage;
   dataDoc["bat_pct"] = batteryPercent;
 
+  // Only present when the device is about to hibernate due to low battery.
+  // Absent in all normal packets — backend should suppress offline alerts
+  // for 24 hours and trigger a low-battery alert when this is true.
+  if (brownoutPending) dataDoc["brownout"] = true;
+
   JsonObject errors = dataDoc.createNestedObject("errors");
   errors["bme"] = bmeError;
   errors["dht"] = dhtError;
@@ -311,18 +317,50 @@ float readBatteryVoltage() {
 }
 
 int batteryPercentage(float v) {
-  if (v >= 4.45) return 100;
-  if (v >= 4.30) return 95;
-  if (v >= 4.20) return 90;
-  if (v >= 4.10) return 80;
-  if (v >= 4.00) return 70;
-  if (v >= 3.90) return 60;
-  if (v >= 3.80) return 50;
-  if (v >= 3.70) return 40;
-  if (v >= 3.60) return 30;
-  if (v >= 3.45) return 20;
-  if (v >= 3.30) return 10;
-  return 5;
+  // Standard 18650 Li-ion: 4.20V = 100%, 3.00V = 0%
+  // Lookup table based on a typical discharge curve
+  if (v >= 4.20) return 100;
+  if (v >= 4.10) return 90;
+  if (v >= 4.00) return 80;
+  if (v >= 3.90) return 70;
+  if (v >= 3.80) return 60;
+  if (v >= 3.70) return 50;
+  if (v >= 3.60) return 40;
+  if (v >= 3.50) return 30;
+  if (v >= 3.40) return 20;
+  if (v >= 3.20) return 10;
+  if (v >= 3.00) return 5;
+  return 0;  // at or below 3.00V — protect the cell, stop discharging
+}
+
+// ============================================================
+//  BROWNOUT PROTECTION
+//  Called after readBatteryVoltage(). Confirms low voltage with
+//  5 re-samples over 500 ms to reject transient ADC glitches.
+//  On confirmation, sets brownoutPending = true so the next
+//  publishTelemetry() call includes brownout:true inside the
+//  standard signed envelope, then hibernates for 1 day.
+// ============================================================
+void handleBrownoutIfNeeded() {
+  if (batteryVoltage >= BROWNOUT_VOLTAGE) return;
+
+  LOG("[Brownout] Low voltage detected (" + String(batteryVoltage, 2) + "V) — confirming...");
+  int confirmCount = 0;
+  for (int i = 0; i < 5; i++) {
+    delay(100);
+    if (readBatteryVoltage() < BROWNOUT_VOLTAGE) confirmCount++;
+  }
+
+  if (confirmCount < 4) {  // require 4 out of 5 — rejects single-sample glitches
+    LOG("[Brownout] False alarm (" + String(confirmCount) + "/5 confirmed) — continuing");
+    return;
+  }
+
+  LOG("[Brownout] Confirmed (" + String(confirmCount) + "/5) — flagging for hibernation");
+  brownoutPending = true;
+  // publishTelemetry() will be called by the normal flow in loop() and will
+  // include brownout:true in the signed data object. After it returns,
+  // loop() checks brownoutPending and enters hibernation.
 }
 
 // ============================================================
@@ -331,8 +369,11 @@ int batteryPercentage(float v) {
 void readSensors() {
   ledCapturing();  // GREEN - actively reading sensors
 
+  brownoutPending = false;  // reset each cycle — set again by handleBrownoutIfNeeded() if needed
   batteryVoltage = readBatteryVoltage();
   batteryPercent = batteryPercentage(batteryVoltage);
+
+  handleBrownoutIfNeeded();
 
   // BME680
   Wire.beginTransmission(0x77);
@@ -594,6 +635,17 @@ void loop() {
     readSensors();
     publishTelemetry();
     lastPublish = millis();
+
+    if (brownoutPending) {
+      ledFlashBrownout(6);  // RED flash — signals critical battery before going dark
+      LOG("[Brownout] Entering hibernation...");
+      mqtt.disconnect();
+      delay(200);
+      WiFi.disconnect(true);
+      delay(100);
+      ledOff();
+      esp_deep_sleep(BROWNOUT_SLEEP_US);  // 1 day — retry after cell recovers slightly
+    }
   }
 
   server.handleClient();
@@ -604,6 +656,17 @@ void loop() {
 
   readSensors();
   publishTelemetry();
+
+  if (brownoutPending) {
+    ledFlashBrownout(6);  // RED flash — signals critical battery before going dark
+    LOG("[Brownout] Entering hibernation...");
+    mqtt.disconnect();
+    delay(200);
+    WiFi.disconnect(true);
+    delay(100);
+    ledOff();
+    esp_deep_sleep(BROWNOUT_SLEEP_US);  // 1 day — retry after cell recovers slightly
+  }
 
   // If a sensor error occurred, hold the red LED visible for 2 s
   // before sleeping so the user can actually see it
