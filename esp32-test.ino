@@ -400,10 +400,20 @@ void readSensors() {
       bmeGas = NAN;
     } else {
       bmeError = false;
-      bmeTemp = bme.temperature - 0.7;
-      bmeHum = bme.humidity * 1.23 + 2.85;
+      // Calibrated against DS18B20 (temp) and DHT22 (humidity)
+      // Dataset: 723 readings, 704 clean temp samples, 718 clean DHT samples
+      // BME680 raw temp runs +0.87C hot vs DS18B20 reference (was -0.70)
+      bmeTemp = bme.temperature - 0.87;
+      // BME680 humidity: data-derived linear regression against DHT22
+      // Old: *1.23 + 2.85, mean error 4.4%
+      // New: *1.03 + 7.03, mean error 0.9% (80% improvement)
+      bmeHum = bme.humidity * 1.03 + 7.03;
       bmePressure = bme.pressure / 100.0;
       bmeGas = bme.gas_resistance / 1000.0;
+
+      // DHT22 - reads 0.17C cold vs DS18B20 (was uncalibrated)
+      dhtTemp = dht.readTemperature() + 0.17;
+      dhtHum  = dht.readHumidity();   // DHT22 humidity used as reference, no cal needed
     }
   }
 
